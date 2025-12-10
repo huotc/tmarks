@@ -5,7 +5,7 @@ import { requireAuth, AuthContext } from '../../middleware/auth'
 
 interface UserPreferences {
   user_id: string
-  theme: 'light' | 'dark'
+  theme: 'light' | 'dark' | 'system'
   page_size: number
   view_mode: 'list' | 'card' | 'minimal' | 'title'
   density: 'compact' | 'normal' | 'comfortable'
@@ -24,7 +24,7 @@ interface UserPreferences {
 }
 
 interface UpdatePreferencesRequest {
-  theme?: 'light' | 'dark'
+  theme?: 'light' | 'dark' | 'system'
   page_size?: number
   view_mode?: 'list' | 'card' | 'minimal' | 'title'
   density?: 'compact' | 'normal' | 'comfortable'
@@ -59,6 +59,25 @@ async function hasSortByColumn(db: D1Database): Promise<boolean> {
     return true
   } catch (error) {
     if (error instanceof Error && /no such column: sort_by/i.test(error.message)) {
+      return false
+    }
+    throw error
+  }
+}
+
+// 某些旧数据库可能还没有自动清空相关字段，做一次能力探测，避免 500
+async function hasAutomationColumns(db: D1Database): Promise<boolean> {
+  try {
+    // 这些字段在同一个迁移中加入，只检测一个列即可代表这一批字段是否存在
+    await db
+      .prepare('SELECT search_auto_clear_seconds FROM user_preferences LIMIT 1')
+      .first()
+    return true
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      /no such column: search_auto_clear_seconds/i.test(error.message)
+    ) {
       return false
     }
     throw error
@@ -118,9 +137,10 @@ export const onRequestPatch: PagesFunction<Env, RouteParams, AuthContext>[] = [
       const body = await context.request.json() as UpdatePreferencesRequest
       const tagLayoutSupported = await hasTagLayoutColumn(context.env.DB)
       const sortBySupported = await hasSortByColumn(context.env.DB)
+      const automationSupported = await hasAutomationColumns(context.env.DB)
 
       // 验证输入
-      if (body.theme && !['light', 'dark'].includes(body.theme)) {
+      if (body.theme && !['light', 'dark', 'system'].includes(body.theme)) {
         return badRequest('Invalid theme value')
       }
 
@@ -170,6 +190,16 @@ export const onRequestPatch: PagesFunction<Env, RouteParams, AuthContext>[] = [
         return badRequest('Snapshot auto cleanup days must be between 0 and 365')
       }
 
+      // 确保当前用户在 user_preferences 表中有一条记录；
+      // 如果不存在，则插入一条使用表定义默认值的记录，避免 UPDATE 影响 0 行。
+      await context.env.DB.prepare(
+        `INSERT INTO user_preferences (user_id)
+         VALUES (?)
+         ON CONFLICT(user_id) DO NOTHING`
+      )
+        .bind(userId)
+        .run()
+
       // 构建更新语句
       const updates: string[] = []
       const values: SQLParam[] = []
@@ -204,49 +234,53 @@ export const onRequestPatch: PagesFunction<Env, RouteParams, AuthContext>[] = [
         values.push(body.sort_by)
       }
 
-      if (body.search_auto_clear_seconds !== undefined) {
-        updates.push('search_auto_clear_seconds = ?')
-        values.push(body.search_auto_clear_seconds)
+      if (automationSupported) {
+        if (body.search_auto_clear_seconds !== undefined) {
+          updates.push('search_auto_clear_seconds = ?')
+          values.push(body.search_auto_clear_seconds)
+        }
+
+        if (body.tag_selection_auto_clear_seconds !== undefined) {
+          updates.push('tag_selection_auto_clear_seconds = ?')
+          values.push(body.tag_selection_auto_clear_seconds)
+        }
+
+        if (body.enable_search_auto_clear !== undefined) {
+          updates.push('enable_search_auto_clear = ?')
+          values.push(body.enable_search_auto_clear ? 1 : 0)
+        }
+
+        if (body.enable_tag_selection_auto_clear !== undefined) {
+          updates.push('enable_tag_selection_auto_clear = ?')
+          values.push(body.enable_tag_selection_auto_clear ? 1 : 0)
+        }
       }
 
-      if (body.tag_selection_auto_clear_seconds !== undefined) {
-        updates.push('tag_selection_auto_clear_seconds = ?')
-        values.push(body.tag_selection_auto_clear_seconds)
-      }
+      if (automationSupported) {
+        if (body.default_bookmark_icon !== undefined) {
+          updates.push('default_bookmark_icon = ?')
+          values.push(body.default_bookmark_icon)
+        }
 
-      if (body.enable_search_auto_clear !== undefined) {
-        updates.push('enable_search_auto_clear = ?')
-        values.push(body.enable_search_auto_clear ? 1 : 0)
-      }
+        if (body.snapshot_retention_count !== undefined) {
+          updates.push('snapshot_retention_count = ?')
+          values.push(body.snapshot_retention_count)
+        }
 
-      if (body.enable_tag_selection_auto_clear !== undefined) {
-        updates.push('enable_tag_selection_auto_clear = ?')
-        values.push(body.enable_tag_selection_auto_clear ? 1 : 0)
-      }
+        if (body.snapshot_auto_create !== undefined) {
+          updates.push('snapshot_auto_create = ?')
+          values.push(body.snapshot_auto_create ? 1 : 0)
+        }
 
-      if (body.default_bookmark_icon !== undefined) {
-        updates.push('default_bookmark_icon = ?')
-        values.push(body.default_bookmark_icon)
-      }
+        if (body.snapshot_auto_dedupe !== undefined) {
+          updates.push('snapshot_auto_dedupe = ?')
+          values.push(body.snapshot_auto_dedupe ? 1 : 0)
+        }
 
-      if (body.snapshot_retention_count !== undefined) {
-        updates.push('snapshot_retention_count = ?')
-        values.push(body.snapshot_retention_count)
-      }
-
-      if (body.snapshot_auto_create !== undefined) {
-        updates.push('snapshot_auto_create = ?')
-        values.push(body.snapshot_auto_create ? 1 : 0)
-      }
-
-      if (body.snapshot_auto_dedupe !== undefined) {
-        updates.push('snapshot_auto_dedupe = ?')
-        values.push(body.snapshot_auto_dedupe ? 1 : 0)
-      }
-
-      if (body.snapshot_auto_cleanup_days !== undefined) {
-        updates.push('snapshot_auto_cleanup_days = ?')
-        values.push(body.snapshot_auto_cleanup_days)
+        if (body.snapshot_auto_cleanup_days !== undefined) {
+          updates.push('snapshot_auto_cleanup_days = ?')
+          values.push(body.snapshot_auto_cleanup_days)
+        }
       }
 
       if (updates.length === 0) {
@@ -333,7 +367,34 @@ export const onRequestPatch: PagesFunction<Env, RouteParams, AuthContext>[] = [
       })
     } catch (error) {
       console.error('Update preferences error:', error)
-      return internalError('Failed to update preferences')
+
+      // 在无法直接查看 Cloudflare Functions 日志的情况下，
+      // 临时把错误信息附加到响应中，方便前端 Network 面板中排查问题。
+      const baseMessage = 'Failed to update preferences'
+      let details = ''
+
+      if (error instanceof Error) {
+        details = error.message
+      } else if (typeof error === 'string') {
+        details = error
+      }
+
+      const message = details
+        ? `${baseMessage}: ${details}`
+        : baseMessage
+
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: 'INTERNAL_ERROR',
+            message,
+          },
+        }),
+        {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      )
     }
   },
 ]
